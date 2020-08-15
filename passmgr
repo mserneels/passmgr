@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC1090
+
+declare whoami=user@localhost
+declare password_len=32
+declare database=$HOME/.passwordmanager.db
+declare words_file=wordlist
+declare clipboard=false
+declare clipboard_timeout=0
+declare display=:0	# x11 screen when using clipboad
+declare action=help	# default action
+
+declare punct='!"#%&()*+,-./:;<=>?@[\]^_`{|}~$ '
+declare -A leetspeak=([a]='4' [b]='8' [e]='3' [g]='9' [i]='1' [s]='5' [t]='7')
+
+[[ -e $HOME/.passwordmanager.conf && -f $HOME/.passwordmanager.conf ]] && source "$HOME/.passwordmanager.conf"
+[[ -e $words_file && -f $words_file ]] || words_file=/usr/share/dict/words
+
+
+# check if gpg key exist
+if ! gpg --list-keys | grep -q "$whoami"; then
+	printf 'GPG key not found for identity "%s".\n' "$whoami"
+	exit 255
+fi
+
+usage() {
+	printf '\nusage:\n\n'
+	while IFS=: read -r i j; do
+		printf '%-20s %s\n' "$i" "$j"
+	done < <(grep '^## ' "$0" | sed -e "s;^## ;;" -e 's;^~~;;;')
+	echo
+}
+
+# convert string
+_convert() {
+	local strlen=${#1} ret='' x chr lchr
+	for ((x=0; x<strlen; x++)); do
+		chr="${1:$x:1}"
+		lchr=${chr,,}
+
+		# do some basic leetspeak conversion
+		if [[ ${!leetspeak[$lchr]} ]]; then
+			ret+=${leetspeak[$lchr]}
+
+		# or replace spaces with random punct chars (including the space chr)
+		elif [[ $chr = ' ' ]]; then
+			ret+="${punct:$(( RANDOM % ${#punct} )):1}"
+
+		# or RANDOMly switch {upper,lower}case
+		elif ((RANDOM < RANDOM)); then
+			if [[ ${chr,,} = "$chr" ]]; then ret+=${chr^^}
+			else ret+=${chr,,}; fi
+
+		# if RANDOM stuff didn't apply, leave char as it is
+		else
+			ret+=$chr
+		fi
+	done
+	printf '%s\n' "${ret:0:$password_len}"
+}
+
+_delete() {
+	_user_serv_exist || return 1
+	read -r -p 'key found. Delete ? (y/N): ' confirm
+	[[ -n ${confirm} && ${confirm,,} = y ]] || { echo 'Aborting.'; return; }
+
+	unset -v 'passwords[x${username}_${service}x]'
+	declare -p passwords | gpg --batch --yes --encrypt --output "$database" --recipient "$whoami" -
+	printf 'user "%s" on service "%s" has been removed.\n' "$username" "$service"
+}
+
+_user_serv_exist() {
+	[[ -n $username ]] || read -rp 'username: ' username
+	[[ -n $service ]] || read -rp 'service : ' service
+	[[ ${passwords[x${username}_${service}x]} ]] || { printf 'ENOTFOUND\n'; return 1; }
+}
+
+_share() {
+	local share; declare -A share
+	while :; do
+		_user_serv_exist || return 1
+		share[x${username}_${service}x]=${passwords[x${username}_${service}x]}
+		printf 'password for "%s" on "%s" has been added.\n' "$username" "$service"
+		read -rp 'Share another key? (y/N): ' continue_sharing
+		[[ -n $continue_sharing && ${continue_sharing,,} = y ]] || break
+	done
+	((${#share[@]})) || {
+		printf 'nothing to export, aborting.\n'
+		return
+	}
+	[[ -n $recipient ]] || read -rp 'recipient (email) to share with: ' recipient
+	read -r random _ < <(dd if=/dev/urandom bs=512 count=1 | shasum)
+	mapfile -t shared_password < <(
+	declare -p share | \
+		gpg --batch --yes --encrypt --output - --recipient "$recipient" --armor | \
+		KEY=$random openssl enc -des-ecb -K "$random" -in - | base64
+	)
+	printf '\n%s\n\n' "${shared_password}"
+}
+
+_import() {
+	:
+}
+
+_list() {
+	local item username service
+	printf '\n%-20s %-15s %-40s\n\n' 'SERVICE' 'USERNAME' 'PASSWORD'
+	for item in "${!passwords[@]}"; do
+		IFS=$'_' read -r username service <<<"$item"
+		printf '%-20s %-15s %-40s\n' "${service:0:-1}" "${username:1}" "${passwords[$item]}"
+	done
+	echo
+}
+
+_copy() {
+	_user_serv_exist || return 1
+	printf '%s' "${passwords[x${username}_${service}x]}" | xclip
+	echo item copied
+}
+
+_add() {
+	_save() {
+		if [[ -n $fixed ]]; then
+			password=$3 confirm=''
+			echo; read -rsp 'confirm  (will not echo): ' confirm
+			[[ $confirm = "$password" ]] || { printf '\n\nProvided passwords missmatch, aborting.\n\n'; exit 255; }
+		fi
+		gpg=(
+			gpg --batch --yes --encrypt
+			--output "$database"
+			--recipient "$whoami" -
+		)
+		#[[ -n $gpg_file ]] && gpg+=()
+		passwords[x${username}_${service}x]=${password}
+		# overwrite database
+		declare -p passwords | "${gpg[@]}"
+		printf '\n%s\n' "${password}"
+	}
+
+	password=()
+	[[ -n $username ]] || read -rp 'username: ' username
+	[[ -n $service ]] || read -rp 'service : ' service
+
+	# user or service is empty: error
+	if [[ -z $username || -z $service ]]; then
+		printf 'ERROR: username or service cannot be empty.\n'
+
+	# user/service pair is found
+	elif [[ -n ${passwords[x${username}_${service}x]} ]]; then
+		if ((clipboard)); then 
+			printf '%s' "${passwords[x${username}_${service}x]}" | xclip
+			((clipboard_timeout)) && (sleep "$clipboard_timeout"; dd if=/dev/urandom bs=128 count=1 | DISPLAY="${DISPLAY:-${display:-:0}}" xclip) &
+		fi
+		printf '\n%s\n' "${passwords[x${username}_${service}x]}"
+
+	# user-defined password
+	elif [[ -n $fixed && $fixed -eq 1 ]]; then
+		read -rsp 'password (will not echo): ' password
+		_save "$username" "$service" "$password"
+
+	# or generate new password for the userservice
+	else
+		local words; mapfile -t words < "${words_file:-/usr/share/dict/words}"
+		for ((i=0; i<5; i++)); do
+			password+=( "${words[ $(( RANDOM % ${#words[@]} )) ]}" )
+		done
+		read -r password < <(_convert "${password[*]}")
+		_save "$username" "$service" "$password"
+	fi
+}
+
+is_argument() {
+	list_from_array() {
+		match=() needle=$1; shift
+		for p; do [[ $p = $needle* ]] && match+=("$p"); done
+		((${#match[@]})) && printf '%s\n' "${match[@]}"
+	}
+
+	local items ret
+	mapfile -t items < <(list_from_array "$1" "${@:2}")
+	if ((${#items[@]} == 0)); then return 1
+	elif ((${#items[@]} == 1)); then ret=0
+	else ret=255; fi
+
+	printf '%s\n' "${items[0]}"
+	return "$ret"
+}
+
+arguments=(	-a --add
+		-c --copy
+		-d --delete
+		-h --help
+		-l --list
+		-D --database
+		-S --service
+		-U --username
+		-W --wordfile
+		-F --fixed
+		-s --share
+	)
+
+arg=''
+while [[ -n $1 ]]; do
+	[[ -z $1 || $1 = -- ]] && { shift; break; }
+        read -ra arg < <(is_argument "$1" "${arguments[@]}")
+        retcode=$?
+        case $retcode in
+                1) printf '%s: unknown option\n' "$1"; exit "$retcode";;
+                255) printf '%s: ambiguous command, did you mean:\n' "$1"; printf '%s\n' "${arg[@]}"; exit "$retcode";;
+        esac
+
+	case ${arg[0]} in
+## -a|--add: create a new entry.
+		-a|--add) declare action=add;;
+## -c|--copy: copy password to clipboard (uses xclip)
+		-c|--copy) declare action=copy;;
+## -d|--delete: delete some entry
+		-d|--delete) declare action=delete;;
+## -h|--help: show this message
+		-h|--help) usage; exit 0;;
+## -i|--import: import shared key (not impl. yet)
+		-i|--import) declare action=import;;
+## -l|--list: list item(s) in db
+		-l|--list) declare action=list;;
+## -s|--share : share password with other identity (not impl. yet)
+		-s|--share) declare action=share;;
+## ~~
+#		-G|--gpg-file) declare gpg_file=$2; shift;;
+## -D|--database path: password database to use
+		-D|--database) declare database=$2; shift;;
+## -F|--fixed: let user define the password
+		-F|--fixed) declare fixed=1;;
+## -S|--services str: pre-define service
+		-S|--service) declare service=$2; shift;;
+## -U|--username str: pre-define username
+		-U|--username) declare username=$2; shift;;
+## -W|--wordfile path: wordfile to use
+		-W|--wordfile) declare words_file=$2; shift;;
+## --recipient identity: specify recipient identity.
+		--recipient) declare recipient=$2; shift;;
+		*) 
+			[[ -n $1 ]] && {
+				printf 'error: unknown arg "%s"\n' "$1"
+				exit 1
+			}
+			break
+		;;
+	esac
+	shift
+done
+
+if [[ $action = help ]]; then
+	usage
+	exit
+fi
+
+{
+# source decrypted password file if it exists
+if [[ -e $database ]]; then source <(gpg --output - --decrypt "$database")
+# or create new empty password list
+else declare -A passwords; fi
+}
+#echo action: $action
+
+case $action in
+	add) _add;;
+	copy) _copy;;
+	delete) _delete;;
+	export) _export;;
+	import) _import;;
+	list) _list;;
+	share) _share;;
+	view) _view;;
+	*) usage;;
+esac
